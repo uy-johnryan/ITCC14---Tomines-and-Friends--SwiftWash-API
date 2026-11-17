@@ -1,0 +1,2755 @@
+# Revision Summary
+# 1. Pickup/delivery progress: added a rider-managed `fulfillmentStage` field (schema FulfillmentStage, field Order.fulfillmentStage)
+#    and the route PATCH /orders/{orderId}/fulfillment. `status` keeps the proposal values and now moves via
+#    PATCH /orders/{orderId}/status (confirmed, cancelled) or automatically (inprogress at pickup, completed at delivery).
+# 2. Tracking notes and history: every Order response now returns `statusHistory` (schema TrackingEvent) with
+#    note, timestamp, and updatedBy for each update. Notes sent to status, rider, fulfillment, and weights routes are stored there.
+# 3. Partner approval: rules applied to GET /partners, GET /partners/{partnerId}, GET /services, GET /services/{serviceId},
+#    GET /partners/{partnerId}/services, GET /partners/{partnerId}/reviews, GET /reviews, and POST /orders (409 for unapproved
+#    partner or unavailable service). New admin route PATCH /partners/{partnerId}/approval replaces isApproved in PartnerInput.
+# 4. Riders: new GET /riders (partner/admin) lists eligible riders. PATCH /orders/{orderId}/rider now defines when
+#    assignment and reassignment are allowed.
+# 5. Delivery address: added `deliveryAddress` to OrderCreate, OrderUpdate, and Order. When omitted it defaults to pickupAddress.
+# 6. Pricing and validation: items now have estimatedQuantity and actualQuantity. Order has estimatedTotal, finalTotal, and totalPrice.
+#    New route PATCH /orders/{orderId}/actual-quantities records the weighed amounts. POST/PUT /orders return 422 when a service does
+#    not belong to the chosen partner. PUT /orders is allowed only while status is pending. Delete rules for services, partners,
+#    and users document the effect on related records.
+# 7. PUT vs PATCH: PUT /users/{userId} and PUT /reviews/{reviewId} were replaced by PATCH (partial updates). PUT is kept for
+#    partners, services, and orders, and each PUT schema states which fields are required and what omitted optional fields mean.
+# 8. All decisions above are written in the route descriptions, schemas, and responses of this file.
+openapi: 3.0.3
+
+info:
+  title: SwiftWash API
+  version: 1.1.0
+  description: |
+    REST API for **SwiftWash: Online Laundry Pickup and Delivery**.
+
+    SwiftWash lets XU students in Cagayan de Oro City book laundry pick-up and delivery
+    from nearby partner laundromats. Partners accept and process orders, riders update
+    pickup and delivery progress, and every order can be tracked from booking to drop-off.
+
+    **Roles:** `customer`, `partner`, `rider`, `admin`. Most routes require a JWT bearer
+    token. Each route's description states which roles may call it.
+
+    ## Order lifecycle
+
+    An order has two fields that move independently but follow the rules below.
+
+    `status` is the overall lifecycle: `pending` -> `confirmed` -> `inprogress` -> `completed`.
+    An order can be `cancelled` from `pending` or `confirmed` only.
+
+    `fulfillmentStage` is the pickup and delivery progress:
+    `not_started` -> `out_for_pickup` -> `picked_up` -> `ready_for_delivery` -> `out_for_delivery` -> `delivered`.
+
+    | Event | Route | Effect on `status` |
+    |---|---|---|
+    | Partner accepts the order | `PATCH /orders/{orderId}/status` | `pending` -> `confirmed` |
+    | Rider picks up the laundry | `PATCH /orders/{orderId}/fulfillment` | `confirmed` -> `inprogress` (automatic) |
+    | Rider delivers the laundry | `PATCH /orders/{orderId}/fulfillment` | `inprogress` -> `completed` (automatic) |
+    | Customer or partner cancels | `PATCH /orders/{orderId}/status` | `pending` or `confirmed` -> `cancelled` |
+
+    Every change is recorded in the order's `statusHistory` with a timestamp and the user who made it.
+
+    ## Pricing
+
+    Customers send an **estimated** quantity per item. The server snapshots each service's price
+    at booking time, so later price changes never affect existing orders. After the laundromat weighs
+    or counts the laundry, the partner records **actual** quantities. `totalPrice` is the amount due:
+    it equals `estimatedTotal` until actual quantities are recorded, then equals `finalTotal`.
+
+    ## Error format
+
+    All errors use the `Error` schema. Validation errors (422) add a `details` list.
+    Status codes: 400 malformed request, 401 not authenticated, 403 not allowed, 404 not found,
+    409 conflicts with current state, 422 fails validation.
+
+    This file documents only the SwiftWash backend. Map display and address geocoding are done by
+    the frontend, which sends the resulting `latitude` and `longitude` to this API.
+
+    The server URL below is for local development only; no deployed production API URL is claimed.
+
+    **Group:** Tomines and friends. Members: Jezriel Raphael Sia, Floyd Tomines,
+    Ethan Kyle C. Anggot, and John Ryan Uy.
+  contact:
+    name: Tomines and friends
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:5000/api/v1
+    description: Local development server
+
+tags:
+  - name: Auth
+    description: Registration and login (Floyd Tomines)
+  - name: Users
+    description: User accounts, profiles, and admin user management (Floyd Tomines)
+  - name: Orders
+    description: Order booking, tracking, pricing, and status updates (Ethan Anggot, Floyd Tomines)
+  - name: Partners
+    description: Partner laundromat profiles and admin approval (Ethan Anggot, Jezriel Sia)
+  - name: Services
+    description: Services (wash, dry, fold) and prices offered by partners (Ethan Anggot)
+  - name: Reviews
+    description: Ratings and reviews for partner laundromats (Floyd Tomines)
+  - name: Rider
+    description: Rider lookup, assignment, and pickup and delivery progress (John Ryan Uy)
+
+security:
+  - bearerAuth: []
+
+paths:
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Register a new account
+      description: |
+        Creates a new user. Public registration is allowed for the roles `customer`,
+        `partner`, and `rider`. The `admin` role cannot be self-assigned.
+      operationId: registerUser
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+            example:
+              role: customer
+              name: Maria Santos
+              email: maria.santos@example.com
+              password: <your-password>
+              address:
+                street: Corrales Ave, Brgy. Carmen
+                city: Cagayan de Oro
+                latitude: 8.4822
+                longitude: 124.6472
+      responses:
+        '201':
+          description: Account created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+              example:
+                token: <jwt-token>
+                user:
+                  id: 665f1c2e9b1e8a0012a4b3c1
+                  role: customer
+                  name: Maria Santos
+                  email: maria.santos@example.com
+                  isActive: true
+                  address:
+                    street: Corrales Ave, Brgy. Carmen
+                    city: Cagayan de Oro
+                    latitude: 8.4822
+                    longitude: 124.6472
+                  createdAt: '2026-11-03T08:15:00Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in and receive a JWT
+      description: |
+        Verifies the email and password and returns a bearer token for later requests.
+        A deactivated account (`isActive: false`) receives `403`.
+      operationId: loginUser
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            example:
+              email: maria.santos@example.com
+              password: <your-password>
+      responses:
+        '200':
+          description: Login successful.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+              example:
+                token: <jwt-token>
+                user:
+                  id: 665f1c2e9b1e8a0012a4b3c1
+                  role: customer
+                  name: Maria Santos
+                  email: maria.santos@example.com
+                  isActive: true
+                  createdAt: '2026-11-03T08:15:00Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /users:
+    get:
+      tags: [Users]
+      summary: List users
+      description: Returns a paginated list of users. **Admin only.**
+      operationId: listUsers
+      parameters:
+        - name: role
+          in: query
+          description: Filter by role.
+          schema:
+            $ref: '#/components/schemas/Role'
+        - name: isActive
+          in: query
+          description: Filter by active status.
+          schema:
+            type: boolean
+        - name: search
+          in: query
+          description: Case-insensitive match on name or email.
+          schema:
+            type: string
+            example: santos
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of users.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /users/me:
+    get:
+      tags: [Users]
+      summary: Get the logged-in user's profile
+      description: Returns the profile of the user who owns the bearer token.
+      operationId: getCurrentUser
+      responses:
+        '200':
+          description: The current user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /users/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags: [Users]
+      summary: Get a user by ID
+      description: Returns one user. **Admin only**, or the user themselves.
+      operationId: getUser
+      responses:
+        '200':
+          description: The user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [Users]
+      summary: Partially update a user
+      description: |
+        Updates only the fields that are sent. At least one field is required, and unknown
+        fields are rejected with `422`.
+
+        - A user may update their own `name`, `address`, and `password`.
+        - Changing `password` requires `currentPassword` unless the caller is an admin.
+        - `role` and `isActive` can be changed by **admins only** (`403` for anyone else).
+        - Setting `isActive` to `false` is the preferred way to disable an account. Active
+          orders are not affected, but the user can no longer log in.
+        - `email` cannot be changed.
+      operationId: updateUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserUpdate'
+            example:
+              name: Maria S. Santos
+              address:
+                street: Hayes St, Brgy. Nazareth
+                city: Cagayan de Oro
+                latitude: 8.4871
+                longitude: 124.6521
+      responses:
+        '200':
+          description: The updated user.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    delete:
+      tags: [Users]
+      summary: Delete a user
+      description: |
+        Permanently removes a user account. **Admin only.**
+
+        Returns `409` if the user is a customer or rider on an order that is not yet
+        `completed` or `cancelled`, or owns a partner profile with such orders. Disable the
+        account with `PATCH` and `isActive: false` instead. When the delete succeeds, the user's
+        partner profile (if any) and services are removed with it, and completed or cancelled
+        orders are kept for history.
+      operationId: deleteUser
+      responses:
+        '204':
+          description: User deleted. No content.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /riders:
+    get:
+      tags: [Rider]
+      summary: Find eligible riders
+      description: |
+        Lets a partner look up riders before assigning one to an order. **Partner (with an
+        approved profile) and admin only.**
+
+        Only users with the `rider` role and `isActive: true` are listed. A rider is
+        **available** when none of their orders is currently `out_for_pickup` or
+        `out_for_delivery`. `activeOrderCount` may be greater than zero for orders waiting at the
+        partner or laundry facility, but those orders do not by themselves make the rider unavailable. Availability is rechecked by the
+        assignment endpoint at write time to prevent two partners assigning the same rider.
+        Only `id`, `name`, availability, and workload are returned. Email and address stay private.
+      operationId: listRiders
+      parameters:
+        - name: available
+          in: query
+          description: When `true`, return only riders who can be assigned right now.
+          schema:
+            type: boolean
+            default: false
+        - name: search
+          in: query
+          description: Case-insensitive match on rider name.
+          schema:
+            type: string
+            example: juan
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of riders.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RiderList'
+              example:
+                data:
+                  - id: 665f1e5a9b1e8a0012a4b3d4
+                    name: Juan Dela Cruz
+                    isAvailable: true
+                    activeOrderCount: 1
+                meta:
+                  page: 1
+                  limit: 10
+                  total: 1
+                  totalPages: 1
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /partners:
+    get:
+      tags: [Partners]
+      summary: List partner laundromats
+      description: |
+        Returns a paginated list of partner laundromats for the partner list and map pins.
+
+        **Approval rule:** anonymous callers and all roles except admin receive **approved**
+        partners only. Admins see all partners. A partner who needs their own profile, even before
+        approval, sends `mine=true`.
+
+        Public route. A token is optional, but an invalid token returns `401`.
+      operationId: listPartners
+      security:
+        - {}
+        - bearerAuth: []
+      parameters:
+        - name: mine
+          in: query
+          description: When `true`, return only the caller's own partner profile, approved or not. **Partner role only.**
+          schema:
+            type: boolean
+            default: false
+        - name: search
+          in: query
+          description: Case-insensitive match on business name.
+          schema:
+            type: string
+            example: bubble
+        - name: minRating
+          in: query
+          description: Only return partners with an average rating at or above this value.
+          schema:
+            type: number
+            minimum: 1
+            maximum: 5
+            example: 4
+        - name: lat
+          in: query
+          description: Latitude of the search center. Use together with `lng` and `radiusKm`.
+          schema:
+            type: number
+            format: double
+            example: 8.4822
+        - name: lng
+          in: query
+          description: Longitude of the search center.
+          schema:
+            type: number
+            format: double
+            example: 124.6472
+        - name: radiusKm
+          in: query
+          description: Search radius in kilometers.
+          schema:
+            type: number
+            minimum: 0.1
+            default: 5
+        - name: isApproved
+          in: query
+          description: Filter by approval status. **Admin only.** Ignored for other callers, who always get approved partners.
+          schema:
+            type: boolean
+        - name: sort
+          in: query
+          description: Sort order.
+          schema:
+            type: string
+            enum: [rating, -rating, businessName, -createdAt]
+            default: -rating
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of partners.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PartnerList'
+              example:
+                data:
+                  - id: 665f2a7b9b1e8a0012a4b4d2
+                    userId: 665f1d419b1e8a0012a4b3c9
+                    businessName: Bubble Express Laundry
+                    description: Wash, dry, and fold near XU main gate.
+                    location:
+                      street: Don Apolinar Velez St
+                      city: Cagayan de Oro
+                      latitude: 8.4786
+                      longitude: 124.6471
+                    rating: 4.6
+                    ratingCount: 38
+                    isApproved: true
+                    createdAt: '2026-10-01T09:00:00Z'
+                meta:
+                  page: 1
+                  limit: 10
+                  total: 1
+                  totalPages: 1
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [Partners]
+      summary: Create a partner profile
+      description: |
+        Creates a laundromat profile linked to the logged-in user. **Partner role only**
+        (one profile per user, otherwise `409`). New profiles start with `isApproved: false`
+        and stay hidden from the public, and from booking, until an admin approves them
+        with `PATCH /partners/{partnerId}/approval`.
+      operationId: createPartner
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PartnerInput'
+            example:
+              businessName: Bubble Express Laundry
+              description: Wash, dry, and fold near XU main gate.
+              location:
+                street: Don Apolinar Velez St
+                city: Cagayan de Oro
+                latitude: 8.4786
+                longitude: 124.6471
+      responses:
+        '201':
+          description: Partner created.
+          headers:
+            Location:
+              description: URL of the new partner.
+              schema:
+                type: string
+                example: /api/v1/partners/665f2a7b9b1e8a0012a4b4d2
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Partner'
+              example:
+                id: 665f2a7b9b1e8a0012a4b4d2
+                userId: 665f1d419b1e8a0012a4b3c9
+                businessName: Bubble Express Laundry
+                description: Wash, dry, and fold near XU main gate.
+                location:
+                  street: Don Apolinar Velez St
+                  city: Cagayan de Oro
+                  latitude: 8.4786
+                  longitude: 124.6471
+                rating: 0
+                ratingCount: 0
+                isApproved: false
+                createdAt: '2026-10-01T09:00:00Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /partners/{partnerId}:
+    parameters:
+      - $ref: '#/components/parameters/PartnerId'
+    get:
+      tags: [Partners]
+      summary: Get a partner by ID
+      description: |
+        Returns one partner laundromat.
+
+        **Approval rule:** an unapproved partner is returned only to its owner and to admins.
+        Everyone else receives `404`, so unapproved partners cannot be discovered by ID.
+
+        Public route. A token is optional, but an invalid token returns `401`.
+      operationId: getPartner
+      security:
+        - {}
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The partner.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Partner'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Partners]
+      summary: Replace a partner's profile
+      description: |
+        **Full replacement** of the editable profile fields. `businessName` and `location` are
+        required. An omitted `description` is cleared. Allowed for the owning partner and admins.
+        Approval is not changed here. Admins use `PATCH /partners/{partnerId}/approval`.
+      operationId: updatePartner
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PartnerInput'
+            example:
+              businessName: Bubble Express Laundry and Dry Clean
+              description: Now open until 10 PM.
+              location:
+                street: Don Apolinar Velez St
+                city: Cagayan de Oro
+                latitude: 8.4786
+                longitude: 124.6471
+      responses:
+        '200':
+          description: The updated partner.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Partner'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    delete:
+      tags: [Partners]
+      summary: Delete a partner
+      description: |
+        Removes a partner. Allowed for admins and the owning partner.
+
+        Returns `409` while the partner has orders that are not yet `completed` or `cancelled`.
+        On success the partner's services and reviews are removed. Completed and cancelled orders
+        are kept for history. To stop taking bookings without deleting, an admin can set
+        `isApproved` to `false`.
+      operationId: deletePartner
+      responses:
+        '204':
+          description: Partner deleted. No content.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /partners/{partnerId}/approval:
+    parameters:
+      - $ref: '#/components/parameters/PartnerId'
+    patch:
+      tags: [Partners]
+      summary: Approve or suspend a partner
+      description: |
+        Sets `isApproved` on a partner. **Admin only.**
+
+        - `true` makes the partner, its available services, and its reviews visible and bookable.
+        - `false` hides them again and blocks new bookings. Orders already booked continue normally.
+      operationId: setPartnerApproval
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PartnerApproval'
+            example:
+              isApproved: true
+              note: Business permit verified.
+      responses:
+        '200':
+          description: The partner with its new approval status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Partner'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /partners/{partnerId}/services:
+    parameters:
+      - $ref: '#/components/parameters/PartnerId'
+    get:
+      tags: [Partners, Services]
+      summary: List the services of one partner
+      description: |
+        Shortcut for `GET /services?partnerId={partnerId}` and follows the same visibility rules.
+        Returns `404` if the partner is not visible to the caller (unapproved partner).
+        The owner and admins also see unavailable services.
+
+        Public route. A token is optional, but an invalid token returns `401`.
+      operationId: listPartnerServices
+      security:
+        - {}
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of services.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServiceList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /partners/{partnerId}/reviews:
+    parameters:
+      - $ref: '#/components/parameters/PartnerId'
+    get:
+      tags: [Partners, Reviews]
+      summary: List the reviews of one partner
+      description: |
+        Shortcut for `GET /reviews?partnerId={partnerId}`. Returns `404` if the partner is not
+        visible to the caller (unapproved partner).
+
+        Public route. A token is optional, but an invalid token returns `401`.
+      operationId: listPartnerReviews
+      security:
+        - {}
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of reviews.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReviewList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /services:
+    get:
+      tags: [Services]
+      summary: List services
+      description: |
+        Returns a paginated list of services and prices.
+
+        **Visibility rule:** anonymous callers and all roles except the owner and admins receive only
+        services that are `isAvailable: true` **and** belong to an **approved** partner. The owning partner
+        sees all of their own services, and admins see everything.
+
+        Public route. A token is optional, but an invalid token returns `401`.
+      operationId: listServices
+      security:
+        - {}
+        - bearerAuth: []
+      parameters:
+        - name: partnerId
+          in: query
+          description: Only services offered by this partner.
+          schema:
+            $ref: '#/components/schemas/ObjectId'
+        - name: type
+          in: query
+          description: Filter by service type.
+          schema:
+            $ref: '#/components/schemas/ServiceType'
+        - name: isAvailable
+          in: query
+          description: Filter by availability. Honored for the owning partner and admins only. For other callers the result is always available services.
+          schema:
+            type: boolean
+        - name: maxPrice
+          in: query
+          description: Only services priced at or below this amount (PHP).
+          schema:
+            type: number
+            minimum: 0
+            example: 100
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of services.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServiceList'
+              example:
+                data:
+                  - id: 665f2b3c9b1e8a0012a4b5e7
+                    partnerId: 665f2a7b9b1e8a0012a4b4d2
+                    type: wash
+                    name: Wash per kilo
+                    price: 45
+                    unit: kg
+                    isAvailable: true
+                    createdAt: '2026-10-01T09:30:00Z'
+                meta:
+                  page: 1
+                  limit: 10
+                  total: 1
+                  totalPages: 1
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Services]
+      summary: Create a service
+      description: |
+        Adds a service to the logged-in partner's laundromat. **Partner role only**, and the
+        partner must already have a profile (`403` otherwise). A partner may prepare services before
+        approval. They stay hidden until the partner is approved. A duplicate `type` and `name` for the
+        same partner returns `409`.
+      operationId: createService
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ServiceInput'
+            example:
+              type: wash
+              name: Wash per kilo
+              price: 45
+              unit: kg
+              isAvailable: true
+      responses:
+        '201':
+          description: Service created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Service'
+              example:
+                id: 665f2b3c9b1e8a0012a4b5e7
+                partnerId: 665f2a7b9b1e8a0012a4b4d2
+                type: wash
+                name: Wash per kilo
+                price: 45
+                unit: kg
+                isAvailable: true
+                createdAt: '2026-10-01T09:30:00Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /services/{serviceId}:
+    parameters:
+      - $ref: '#/components/parameters/ServiceId'
+    get:
+      tags: [Services]
+      summary: Get a service by ID
+      description: |
+        Returns one service. An unavailable service, or a service of an unapproved partner, is
+        returned only to its owner and admins. Everyone else receives `404`.
+
+        Public route. A token is optional, but an invalid token returns `401`.
+      operationId: getService
+      security:
+        - {}
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The service.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Service'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Services]
+      summary: Replace a service
+      description: |
+        **Full replacement.** `type`, `name`, and `price` are required. An omitted `unit` resets to
+        `kg` and an omitted `isAvailable` resets to `true`. Allowed for the owning partner and admins.
+
+        Changing the price does **not** change existing orders, because each order stores its own
+        price snapshot. The new price applies to future bookings only.
+      operationId: updateService
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ServiceInput'
+            example:
+              type: wash
+              name: Wash per kilo
+              price: 50
+              unit: kg
+              isAvailable: true
+      responses:
+        '200':
+          description: The updated service.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Service'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    delete:
+      tags: [Services]
+      summary: Delete a service
+      description: |
+        Removes a service. Allowed for the owning partner and admins.
+
+        Returns `409` if the service is used by an order that is `pending`, `confirmed`, or
+        `inprogress`. In that case set `isAvailable` to `false` with `PUT` instead. Completed and
+        cancelled orders keep their own copy of the item, so history is not changed.
+      operationId: deleteService
+      responses:
+        '204':
+          description: Service deleted. No content.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /orders:
+    get:
+      tags: [Orders]
+      summary: List orders
+      description: |
+        Returns a paginated list of orders, scoped by the caller's role:
+        - **customer** sees only their own orders
+        - **partner** sees orders for their laundromat
+        - **rider** sees orders assigned to them
+        - **admin** sees all orders
+
+        Each order includes its `statusHistory`.
+      operationId: listOrders
+      parameters:
+        - name: status
+          in: query
+          description: Filter by order status.
+          schema:
+            $ref: '#/components/schemas/OrderStatus'
+        - name: fulfillmentStage
+          in: query
+          description: Filter by pickup and delivery stage.
+          schema:
+            $ref: '#/components/schemas/FulfillmentStage'
+        - name: partnerId
+          in: query
+          description: Filter by partner (admin only).
+          schema:
+            $ref: '#/components/schemas/ObjectId'
+        - name: riderId
+          in: query
+          description: Filter by assigned rider (admin or partner).
+          schema:
+            $ref: '#/components/schemas/ObjectId'
+        - name: pickupFrom
+          in: query
+          description: Only orders with a pickup date on or after this date.
+          schema:
+            type: string
+            format: date
+            example: '2026-11-01'
+        - name: pickupTo
+          in: query
+          description: Only orders with a pickup date on or before this date.
+          schema:
+            type: string
+            format: date
+            example: '2026-11-30'
+        - name: sort
+          in: query
+          description: Sort order.
+          schema:
+            type: string
+            enum: [createdAt, -createdAt, pickupDate, -pickupDate]
+            default: -createdAt
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of orders.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [Orders]
+      summary: Book a new order
+      description: |
+        Creates a laundry order. **Customer role only.** The order starts with `status: pending`
+        and `fulfillmentStage: not_started`.
+
+        **Validation rules**
+        - `partnerId` must exist (`404`).
+        - The partner must be **approved** (`409` otherwise).
+        - Every item's `serviceId` must belong to the chosen partner (`422` otherwise).
+        - Every selected service must be `isAvailable: true` (`409` otherwise).
+        - `pickupDate` must be in the future and `deliveryDate` must be later than `pickupDate` (`422`).
+
+        **Addresses:** `pickupAddress` is required. `deliveryAddress` is optional. When omitted,
+        delivery returns to the pickup address, and the response shows the resolved `deliveryAddress`.
+        When a separate delivery address is supplied, the partner/rider must use that destination for drop-off.
+
+        **Pricing:** the server copies each service's current price into the item and computes
+        `estimatedTotal` from `estimatedQuantity`. `finalTotal` stays `null` until the partner
+        records actual quantities. The first `statusHistory` entry is written automatically.
+      operationId: createOrder
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderCreate'
+            example:
+              partnerId: 665f2a7b9b1e8a0012a4b4d2
+              items:
+                - serviceId: 665f2b3c9b1e8a0012a4b5e7
+                  description: Mixed clothes
+                  estimatedQuantity: 4
+              pickupDate: '2026-11-05T09:00:00Z'
+              deliveryDate: '2026-11-06T17:00:00Z'
+              pickupAddress:
+                street: Corrales Ave, Brgy. Carmen
+                city: Cagayan de Oro
+                latitude: 8.4822
+                longitude: 124.6472
+              deliveryAddress:
+                street: Hayes St, Brgy. Nazareth
+                city: Cagayan de Oro
+                latitude: 8.4871
+                longitude: 124.6521
+              specialInstructions: Please use fragrance-free detergent. Call on arrival.
+      responses:
+        '201':
+          description: Order created.
+          headers:
+            Location:
+              description: URL of the new order.
+              schema:
+                type: string
+                example: /api/v1/orders/665f3c8d9b1e8a0012a4b6f3
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+              examples:
+                newOrder:
+                  $ref: '#/components/examples/OrderPending'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /orders/{orderId}:
+    parameters:
+      - $ref: '#/components/parameters/OrderId'
+    get:
+      tags: [Orders]
+      summary: Get an order by ID
+      description: |
+        Returns one order with its items, prices, current `status` and `fulfillmentStage`, and
+        full `statusHistory`. Only the customer, partner, or rider on the order, or an admin, may view it.
+      operationId: getOrder
+      responses:
+        '200':
+          description: The order.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+              examples:
+                pendingOrder:
+                  $ref: '#/components/examples/OrderPending'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags: [Orders]
+      summary: Replace an order's booking details
+      description: |
+        **Full replacement** of the booking details. Allowed for the owning customer and admins,
+        **only while `status` is `pending`**. After the partner confirms, the order is locked (`409`).
+        To change a confirmed order, cancel it with `PATCH /orders/{orderId}/status` and book again.
+
+        **Required:** `items`, `pickupDate`, `deliveryDate`, `pickupAddress`.
+        **Optional:** `deliveryAddress` (omitted means delivery returns to `pickupAddress`) and
+        `specialInstructions` (omitted means cleared).
+
+        `partnerId` cannot be changed. The same validation as `POST /orders` applies: services must
+        belong to the order's partner (`422`), and the partner must still be approved and each service
+        still available (`409`). Unit prices are copied again from the current service prices and
+        `estimatedTotal` is recalculated.
+      operationId: updateOrder
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderUpdate'
+            example:
+              items:
+                - serviceId: 665f2b3c9b1e8a0012a4b5e7
+                  description: Mixed clothes and bedsheets
+                  estimatedQuantity: 6
+              pickupDate: '2026-11-05T10:00:00Z'
+              deliveryDate: '2026-11-06T17:00:00Z'
+              pickupAddress:
+                street: Corrales Ave, Brgy. Carmen
+                city: Cagayan de Oro
+                latitude: 8.4822
+                longitude: 124.6472
+              specialInstructions: Add extra rinse.
+      responses:
+        '200':
+          description: The updated order.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+              examples:
+                updatedOrder:
+                  $ref: '#/components/examples/OrderPending'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    delete:
+      tags: [Orders]
+      summary: Delete an order
+      description: |
+        Removes an order record. The owning customer may delete only `pending` or `cancelled`
+        orders. Admins may delete any order. Any other case returns `409`. To stop an active order,
+        use `PATCH /orders/{orderId}/status` with `cancelled` instead. If an admin deletes a
+        completed order, its review is deleted too and the partner's rating is recalculated.
+      operationId: deleteOrder
+      responses:
+        '204':
+          description: Order deleted. No content.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /orders/{orderId}/status:
+    parameters:
+      - $ref: '#/components/parameters/OrderId'
+    patch:
+      tags: [Orders]
+      summary: Confirm or cancel an order
+      description: |
+        Changes the overall `status` by a decision. Only two values can be set here. `inprogress`
+        and `completed` are set automatically by `PATCH /orders/{orderId}/fulfillment`.
+
+        | Caller | Allowed change |
+        |---|---|
+        | partner of the order | `pending` -> `confirmed`, or `pending`/`confirmed` -> `cancelled` (decline) |
+        | customer who owns the order | `pending`/`confirmed` -> `cancelled` |
+        | admin | any of the changes above |
+
+        Cancelling is not possible once the laundry is picked up (`inprogress`), and `completed` or
+        `cancelled` orders cannot change (`409`). The optional `note` is shown to the customer in
+        `statusHistory`, together with the timestamp and the user who made the change.
+      operationId: updateOrderStatus
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderStatusUpdate'
+            example:
+              status: confirmed
+              note: Order accepted. We will assign a rider for tomorrow morning.
+      responses:
+        '200':
+          description: The order with its new status and history.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+              examples:
+                confirmedOrder:
+                  $ref: '#/components/examples/OrderConfirmed'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /orders/{orderId}/rider:
+    parameters:
+      - $ref: '#/components/parameters/OrderId'
+    patch:
+      tags: [Orders, Rider]
+      summary: Assign or reassign a rider
+      description: |
+        Assigns a rider to an order, or replaces the current rider. Allowed for the **partner of
+        the order** and admins. Use `GET /riders?available=true` to find eligible riders first.
+
+        **When assignment is allowed**
+        - Order `status` is `confirmed` or `inprogress` (`409` for `pending`, `completed`, `cancelled`).
+        - `fulfillmentStage` is `not_started`, `picked_up`, or `ready_for_delivery`, meaning no
+          rider is currently on a trip. A rider who is `out_for_pickup` or `out_for_delivery` cannot
+          be replaced by a partner (`409`). Admins may override this.
+
+        **Reassignment** is allowed under the same conditions. It replaces `riderId`, and the
+        previous rider immediately loses access to the order.
+
+        **Eligible rider:** a user with the `rider` role and `isActive: true` (`422` otherwise) who has
+        no active pickup or delivery trip for another order (`409`). The server MUST recheck this
+        condition atomically when saving the assignment; a prior `GET /riders` result is not a
+        reservation and may become stale. This prevents concurrent assignments from allocating
+        the same rider to overlapping trips.
+
+        The change is added to `statusHistory` as a `rider_assignment` entry with the optional `note`.
+      operationId: assignRider
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RiderAssignment'
+            example:
+              riderId: 665f1e5a9b1e8a0012a4b3d4
+              note: Pickup is at the dorm gate.
+      responses:
+        '200':
+          description: The order with the assigned rider.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+              examples:
+                riderAssigned:
+                  $ref: '#/components/examples/OrderRiderAssigned'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /orders/{orderId}/fulfillment:
+    parameters:
+      - $ref: '#/components/parameters/OrderId'
+    patch:
+      tags: [Orders, Rider]
+      summary: Update pickup and delivery progress
+      description: |
+        Moves the order to the next `fulfillmentStage`. Each stage can only be set by the role
+        in the table, and only in this order. Any other change returns `409`.
+
+        | From | To | Who | Extra rule |
+        |---|---|---|---|
+        | `not_started` | `out_for_pickup` | assigned rider | order must be `confirmed` with a rider assigned |
+        | `out_for_pickup` | `picked_up` | assigned rider | server sets `status` to `inprogress` |
+        | `picked_up` | `ready_for_delivery` | partner of the order | actual quantities must be recorded first |
+        | `ready_for_delivery` | `out_for_delivery` | assigned rider | |
+        | `out_for_delivery` | `delivered` | assigned rider | server sets `status` to `completed` |
+
+        Admins may perform any of these changes. A rider who is not assigned to the order receives
+        `403`. The optional `note` (for example, "left with the guard") is saved in `statusHistory`
+        with the timestamp and the user who made the update.
+      operationId: updateOrderFulfillment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderFulfillmentUpdate'
+            example:
+              stage: ready_for_delivery
+              note: Washed, dried, and folded. Ready for the rider.
+      responses:
+        '200':
+          description: The order with its new stage and history.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+              examples:
+                readyOrder:
+                  $ref: '#/components/examples/OrderReady'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /orders/{orderId}/actual-quantities:
+    parameters:
+      - $ref: '#/components/parameters/OrderId'
+    patch:
+      tags: [Orders]
+      summary: Record actual laundry quantities
+      description: |
+        Records the weighed (kg) or counted (piece, load) quantity of every item after the laundromat
+        receives the laundry. For `kg`, decimal quantities are allowed; for `piece` and `load`, quantities
+        must be whole numbers. The server validates each quantity against the unit of its referenced service. Allowed for the **partner of the order** and admins.
+
+        **When:** only while `status` is `inprogress` and `fulfillmentStage` is `picked_up`. It can be
+        sent again to correct a mistake until the stage becomes `ready_for_delivery` (`409` after that).
+
+        **Rules:** the request must contain exactly one entry for every item of the order, and no
+        unknown `itemId` (`422` otherwise).
+
+        **Effect on price:** each item's `subtotal` becomes `actualQuantity x unitPrice`, `finalTotal` is
+        the sum of all subtotals, and `totalPrice` changes from `estimatedTotal` to `finalTotal`. Unit prices
+        stay the ones snapshotted at booking. The updated order response exposes the revised amount due;
+        the customer can see it through order retrieval/tracking. This API design does not define a separate
+        customer-approval step for weight adjustments. The change is added to `statusHistory` as a
+        `weights_recorded` entry whose `from` and `to` values are the previous and new total amounts.
+      operationId: recordActualQuantities
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ActualQuantitiesUpdate'
+            example:
+              items:
+                - itemId: 665f3c8d9b1e8a0012a4b6f4
+                  actualQuantity: 5.2
+              note: Weighed on arrival.
+      responses:
+        '200':
+          description: The order with updated prices.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+              examples:
+                weighedOrder:
+                  $ref: '#/components/examples/OrderWeighed'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /reviews:
+    get:
+      tags: [Reviews]
+      summary: List reviews
+      description: |
+        Returns a paginated list of reviews. Reviews of unapproved partners are visible to admins
+        only. Public route. A token is optional, but an invalid token returns `401`.
+      operationId: listReviews
+      security:
+        - {}
+        - bearerAuth: []
+      parameters:
+        - name: partnerId
+          in: query
+          description: Only reviews for this partner.
+          schema:
+            $ref: '#/components/schemas/ObjectId'
+        - name: customerId
+          in: query
+          description: Only reviews written by this customer.
+          schema:
+            $ref: '#/components/schemas/ObjectId'
+        - name: minRating
+          in: query
+          description: Only reviews with a rating at or above this value.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 5
+        - name: sort
+          in: query
+          description: Sort order.
+          schema:
+            type: string
+            enum: [createdAt, -createdAt, rating, -rating]
+            default: -createdAt
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of reviews.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReviewList'
+              example:
+                data:
+                  - id: 665f4d9e9b1e8a0012a4b7a8
+                    customerId: 665f1c2e9b1e8a0012a4b3c1
+                    partnerId: 665f2a7b9b1e8a0012a4b4d2
+                    orderId: 665f3c8d9b1e8a0012a4b6f3
+                    rating: 5
+                    comment: Fast pickup and the clothes smelled great.
+                    createdAt: '2026-11-07T10:00:00Z'
+                meta:
+                  page: 1
+                  limit: 10
+                  total: 1
+                  totalPages: 1
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Reviews]
+      summary: Write a review
+      description: |
+        Posts a rating and comment for a partner after an order. **Customer role only.**
+        The order must belong to the caller (`403`), be `completed` (`409`), and not already
+        be reviewed (`409`). `customerId` and `partnerId` are taken from the order. The partner's
+        average rating is recalculated.
+      operationId: createReview
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReviewInput'
+            example:
+              orderId: 665f3c8d9b1e8a0012a4b6f3
+              rating: 5
+              comment: Fast pickup and the clothes smelled great.
+      responses:
+        '201':
+          description: Review created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Review'
+              example:
+                id: 665f4d9e9b1e8a0012a4b7a8
+                customerId: 665f1c2e9b1e8a0012a4b3c1
+                partnerId: 665f2a7b9b1e8a0012a4b4d2
+                orderId: 665f3c8d9b1e8a0012a4b6f3
+                rating: 5
+                comment: Fast pickup and the clothes smelled great.
+                createdAt: '2026-11-07T10:00:00Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /reviews/{reviewId}:
+    parameters:
+      - $ref: '#/components/parameters/ReviewId'
+    get:
+      tags: [Reviews]
+      summary: Get a review by ID
+      description: |
+        Returns one review. A review of an unapproved partner is returned to admins only
+        (`404` for others). Public route. A token is optional, but an invalid token returns `401`.
+      operationId: getReview
+      security:
+        - {}
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The review.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Review'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [Reviews]
+      summary: Partially update a review
+      description: |
+        Updates only the fields that are sent (`rating`, `comment`). At least one field is required,
+        and `orderId`, `partnerId`, and `customerId` cannot be changed (`422`). Allowed for the author
+        and admins. The partner's average rating is recalculated.
+      operationId: updateReview
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReviewUpdate'
+            example:
+              rating: 4
+              comment: Good service, delivery was 30 minutes late.
+      responses:
+        '200':
+          description: The updated review.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Review'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    delete:
+      tags: [Reviews]
+      summary: Delete a review
+      description: Removes a review and recalculates the partner's average rating. Allowed for the author and admins.
+      operationId: deleteReview
+      responses:
+        '204':
+          description: Review deleted. No content.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT returned by `POST /auth/login`. Send it as `Authorization Bearer <token>`.
+
+  parameters:
+    Page:
+      name: page
+      in: query
+      description: Page number, starting at 1.
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    Limit:
+      name: limit
+      in: query
+      description: Number of items per page (maximum 100).
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 10
+    UserId:
+      name: userId
+      in: path
+      required: true
+      description: Unique ID of the user.
+      schema:
+        $ref: '#/components/schemas/ObjectId'
+    PartnerId:
+      name: partnerId
+      in: path
+      required: true
+      description: Unique ID of the partner laundromat.
+      schema:
+        $ref: '#/components/schemas/ObjectId'
+    ServiceId:
+      name: serviceId
+      in: path
+      required: true
+      description: Unique ID of the service.
+      schema:
+        $ref: '#/components/schemas/ObjectId'
+    OrderId:
+      name: orderId
+      in: path
+      required: true
+      description: Unique ID of the order.
+      schema:
+        $ref: '#/components/schemas/ObjectId'
+    ReviewId:
+      name: reviewId
+      in: path
+      required: true
+      description: Unique ID of the review.
+      schema:
+        $ref: '#/components/schemas/ObjectId'
+
+  responses:
+    BadRequest:
+      description: The request is malformed (invalid JSON, bad ID format, or bad query value).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            status: 400
+            error: Bad Request
+            message: Invalid ID format.
+    Unauthorized:
+      description: Missing, expired, or invalid token, or wrong credentials.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            status: 401
+            error: Unauthorized
+            message: Authentication token is missing or invalid.
+    Forbidden:
+      description: The caller's role, ownership, or account status does not allow this action.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            status: 403
+            error: Forbidden
+            message: You do not have permission to perform this action.
+    NotFound:
+      description: The requested resource does not exist, or is not visible to the caller.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            status: 404
+            error: Not Found
+            message: Order not found.
+    Conflict:
+      description: |
+        The request conflicts with the current state, such as an invalid status or stage change,
+        an unapproved partner, an unavailable service, or a record that is still in use.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            status: 409
+            error: Conflict
+            message: Cannot change fulfillmentStage from not_started to delivered.
+    ValidationError:
+      description: The body is well-formed JSON but fails validation rules.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ValidationError'
+          example:
+            status: 422
+            error: Unprocessable Entity
+            message: Validation failed.
+            details:
+              - field: items[0].serviceId
+                message: Service does not belong to the chosen partner.
+
+  schemas:
+    ObjectId:
+      type: string
+      pattern: '^[a-f0-9]{24}$'
+      description: MongoDB ObjectId as a 24-character hex string.
+      example: 665f1c2e9b1e8a0012a4b3c1
+
+    Role:
+      type: string
+      enum: [customer, partner, rider, admin]
+      description: Role of a user. A user has exactly one role.
+
+    ServiceType:
+      type: string
+      enum: [wash, dry, fold]
+
+    OrderStatus:
+      type: string
+      enum: [pending, confirmed, inprogress, completed, cancelled]
+      description: Overall order lifecycle. See the lifecycle section in the API description.
+
+    FulfillmentStage:
+      type: string
+      enum: [not_started, out_for_pickup, picked_up, ready_for_delivery, out_for_delivery, delivered]
+      description: |
+        Pickup and delivery progress, updated by the assigned rider (and by the partner for
+        `ready_for_delivery`). Allowed changes are listed under `PATCH /orders/{orderId}/fulfillment`.
+
+    Location:
+      type: object
+      description: A street address with map coordinates.
+      required: [street, city]
+      properties:
+        street:
+          type: string
+          example: Corrales Ave, Brgy. Carmen
+        city:
+          type: string
+          example: Cagayan de Oro
+        latitude:
+          type: number
+          format: double
+          minimum: -90
+          maximum: 90
+          example: 8.4822
+        longitude:
+          type: number
+          format: double
+          minimum: -180
+          maximum: 180
+          example: 124.6472
+
+    UserRef:
+      type: object
+      description: Short reference to the user who made an update.
+      required: [id, name, role]
+      properties:
+        id:
+          $ref: '#/components/schemas/ObjectId'
+        name:
+          type: string
+          example: Juan Dela Cruz
+        role:
+          $ref: '#/components/schemas/Role'
+
+    PageMeta:
+      type: object
+      required: [page, limit, total, totalPages]
+      properties:
+        page:
+          type: integer
+          example: 1
+        limit:
+          type: integer
+          example: 10
+        total:
+          type: integer
+          example: 42
+        totalPages:
+          type: integer
+          example: 5
+
+    Error:
+      type: object
+      required: [status, error, message]
+      properties:
+        status:
+          type: integer
+          example: 404
+        error:
+          type: string
+          example: Not Found
+        message:
+          type: string
+          example: Order not found.
+
+    ValidationError:
+      allOf:
+        - $ref: '#/components/schemas/Error'
+        - type: object
+          properties:
+            details:
+              type: array
+              items:
+                type: object
+                properties:
+                  field:
+                    type: string
+                    example: items[0].serviceId
+                  message:
+                    type: string
+                    example: Service does not belong to the chosen partner.
+
+    RegisterRequest:
+      type: object
+      required: [role, name, email, password]
+      properties:
+        role:
+          type: string
+          enum: [customer, partner, rider]
+          description: Role to register as. `admin` cannot be self-registered.
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+          example: Maria Santos
+        email:
+          type: string
+          format: email
+          example: maria.santos@example.com
+        password:
+          type: string
+          format: password
+          minLength: 8
+          example: <your-password>
+        address:
+          $ref: '#/components/schemas/Location'
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          example: maria.santos@example.com
+        password:
+          type: string
+          format: password
+          example: <your-password>
+
+    AuthResponse:
+      type: object
+      required: [token, user]
+      properties:
+        token:
+          type: string
+          description: JWT to send in the Authorization header.
+          example: <jwt-token>
+        user:
+          $ref: '#/components/schemas/User'
+
+    User:
+      type: object
+      description: A user account. The password hash is never returned.
+      required: [id, role, name, email, isActive]
+      properties:
+        id:
+          $ref: '#/components/schemas/ObjectId'
+        role:
+          $ref: '#/components/schemas/Role'
+        name:
+          type: string
+          example: Maria Santos
+        email:
+          type: string
+          format: email
+          example: maria.santos@example.com
+        isActive:
+          type: boolean
+          description: Inactive users cannot log in and are not listed as eligible riders.
+          example: true
+        address:
+          $ref: '#/components/schemas/Location'
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+
+    UserUpdate:
+      type: object
+      description: Partial update. Send only the fields to change, at least one. Unknown fields are rejected.
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+        address:
+          $ref: '#/components/schemas/Location'
+        password:
+          type: string
+          format: password
+          minLength: 8
+          description: New password. Requires `currentPassword` unless the caller is an admin.
+        currentPassword:
+          type: string
+          format: password
+          description: Required when a non-admin changes `password`.
+        role:
+          allOf:
+            - $ref: '#/components/schemas/Role'
+          description: Admin only.
+        isActive:
+          type: boolean
+          description: Admin only.
+
+    UserList:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/User'
+        meta:
+          $ref: '#/components/schemas/PageMeta'
+
+    RiderSummary:
+      type: object
+      description: Limited rider information that is safe to show to partners.
+      required: [id, name, isAvailable, activeOrderCount]
+      properties:
+        id:
+          $ref: '#/components/schemas/ObjectId'
+        name:
+          type: string
+          example: Juan Dela Cruz
+        isAvailable:
+          type: boolean
+          description: True when the rider has no active pickup or delivery trip for any order; the server rechecks this at assignment time.
+          example: true
+        activeOrderCount:
+          type: integer
+          minimum: 0
+          description: Number of assigned orders that are not yet `completed` or `cancelled`.
+          example: 1
+
+    RiderList:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/RiderSummary'
+        meta:
+          $ref: '#/components/schemas/PageMeta'
+
+    Partner:
+      type: object
+      required: [id, userId, businessName, location, isApproved]
+      properties:
+        id:
+          $ref: '#/components/schemas/ObjectId'
+        userId:
+          $ref: '#/components/schemas/ObjectId'
+        businessName:
+          type: string
+          example: Bubble Express Laundry
+        description:
+          type: string
+          example: Wash, dry, and fold near XU main gate.
+        location:
+          $ref: '#/components/schemas/Location'
+        rating:
+          type: number
+          minimum: 0
+          maximum: 5
+          readOnly: true
+          description: Average rating, calculated from reviews.
+          example: 4.6
+        ratingCount:
+          type: integer
+          readOnly: true
+          example: 38
+        isApproved:
+          type: boolean
+          readOnly: true
+          description: Set by an admin through `PATCH /partners/{partnerId}/approval`. Unapproved partners cannot receive bookings.
+          example: true
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+
+    PartnerInput:
+      type: object
+      description: Full profile used by POST and PUT. `businessName` and `location` are required.
+      required: [businessName, location]
+      properties:
+        businessName:
+          type: string
+          minLength: 2
+          maxLength: 120
+          example: Bubble Express Laundry
+        description:
+          type: string
+          maxLength: 500
+          description: Optional. On PUT, an omitted value clears the description.
+        location:
+          $ref: '#/components/schemas/Location'
+
+    PartnerApproval:
+      type: object
+      required: [isApproved]
+      properties:
+        isApproved:
+          type: boolean
+          example: true
+        note:
+          type: string
+          maxLength: 300
+          example: Business permit verified.
+
+    PartnerList:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Partner'
+        meta:
+          $ref: '#/components/schemas/PageMeta'
+
+    Service:
+      type: object
+      required: [id, partnerId, type, name, price, unit, isAvailable]
+      properties:
+        id:
+          $ref: '#/components/schemas/ObjectId'
+        partnerId:
+          $ref: '#/components/schemas/ObjectId'
+        type:
+          $ref: '#/components/schemas/ServiceType'
+        name:
+          type: string
+          example: Wash per kilo
+        price:
+          type: number
+          minimum: 0
+          description: Price in PHP per unit.
+          example: 45
+        unit:
+          type: string
+          enum: [kg, piece, load]
+          example: kg
+        isAvailable:
+          type: boolean
+          example: true
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+
+    ServiceInput:
+      type: object
+      description: Full service definition used by POST and PUT. `type`, `name`, and `price` are required.
+      required: [type, name, price]
+      properties:
+        type:
+          $ref: '#/components/schemas/ServiceType'
+        name:
+          type: string
+          minLength: 2
+          maxLength: 100
+          example: Wash per kilo
+        price:
+          type: number
+          minimum: 0
+          example: 45
+        unit:
+          type: string
+          enum: [kg, piece, load]
+          default: kg
+          description: On PUT, an omitted value resets to `kg`.
+        isAvailable:
+          type: boolean
+          default: true
+          description: On PUT, an omitted value resets to `true`.
+
+    ServiceList:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Service'
+        meta:
+          $ref: '#/components/schemas/PageMeta'
+
+    OrderItem:
+      type: object
+      description: An item embedded in an order. Name, unit, and price are copied from the service at booking time.
+      required: [id, serviceId, type, name, unit, estimatedQuantity, unitPrice, subtotal]
+      properties:
+        id:
+          $ref: '#/components/schemas/ObjectId'
+        serviceId:
+          $ref: '#/components/schemas/ObjectId'
+        type:
+          $ref: '#/components/schemas/ServiceType'
+        name:
+          type: string
+          example: Wash per kilo
+        unit:
+          type: string
+          enum: [kg, piece, load]
+          example: kg
+        description:
+          type: string
+          example: Mixed clothes
+        estimatedQuantity:
+          type: number
+          minimum: 0.5
+          description: Quantity estimated by the customer when booking. Use whole numbers for `piece` and `load` services; fractional quantities are appropriate only for `kg`.
+          example: 4
+        actualQuantity:
+          type: number
+          nullable: true
+          minimum: 0.1
+          description: Quantity recorded by the partner after weighing or counting. `null` until recorded. Use whole numbers for `piece` and `load` services; fractional quantities are appropriate only for `kg`.
+          example: null
+        unitPrice:
+          type: number
+          minimum: 0
+          description: Price snapshot taken at booking time.
+          example: 45
+        subtotal:
+          type: number
+          minimum: 0
+          readOnly: true
+          description: '`unitPrice` x `actualQuantity` when recorded, otherwise `unitPrice` x `estimatedQuantity`.'
+          example: 180
+
+    OrderItemInput:
+      type: object
+      required: [serviceId, estimatedQuantity]
+      properties:
+        serviceId:
+          $ref: '#/components/schemas/ObjectId'
+        description:
+          type: string
+          maxLength: 200
+          example: Mixed clothes
+        estimatedQuantity:
+          type: number
+          minimum: 0.5
+          example: 4
+
+    TrackingEvent:
+      type: object
+      description: |
+        One operational event in an order's tracking history. Each entry records the event type,
+        old/new value when applicable, optional customer-visible note, actor, and server timestamp.
+        Booking-detail edits (addresses, dates, or item selections) are not operational tracking
+        events and are not included in this history.
+      required: [kind, to, updatedBy, timestamp]
+      properties:
+        kind:
+          type: string
+          enum: [status, fulfillment, rider_assignment, weights_recorded]
+          description: |
+            `status` is a change of `status`. `fulfillment` is a change of `fulfillmentStage`.
+            `rider_assignment` is an assignment or reassignment (`from` and `to` are rider IDs).
+            `weights_recorded` is a recording of actual quantities (`from` and `to` are the old and new `totalPrice` amounts, represented as strings).
+        from:
+          type: string
+          nullable: true
+          description: Previous value, or `null` for the first entry.
+          example: pending
+        to:
+          type: string
+          description: New value.
+          example: confirmed
+        note:
+          type: string
+          nullable: true
+          description: Note shown in the customer's tracking view.
+          example: Order accepted.
+        updatedBy:
+          $ref: '#/components/schemas/UserRef'
+        timestamp:
+          type: string
+          format: date-time
+          example: '2026-11-03T08:45:00Z'
+
+    Order:
+      type: object
+      required:
+        - id
+        - customerId
+        - partnerId
+        - items
+        - pickupDate
+        - deliveryDate
+        - pickupAddress
+        - deliveryAddress
+        - status
+        - fulfillmentStage
+        - estimatedTotal
+        - totalPrice
+        - statusHistory
+      properties:
+        id:
+          $ref: '#/components/schemas/ObjectId'
+        customerId:
+          $ref: '#/components/schemas/ObjectId'
+        partnerId:
+          $ref: '#/components/schemas/ObjectId'
+        riderId:
+          allOf:
+            - $ref: '#/components/schemas/ObjectId'
+          nullable: true
+          description: Assigned rider, or `null` if none yet.
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/OrderItem'
+        pickupDate:
+          type: string
+          format: date-time
+        deliveryDate:
+          type: string
+          format: date-time
+        pickupAddress:
+          $ref: '#/components/schemas/Location'
+        deliveryAddress:
+          allOf:
+            - $ref: '#/components/schemas/Location'
+          description: Where the clean laundry is delivered. Equals `pickupAddress` when the customer did not send a different one.
+        specialInstructions:
+          type: string
+          maxLength: 500
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        fulfillmentStage:
+          $ref: '#/components/schemas/FulfillmentStage'
+        estimatedTotal:
+          type: number
+          minimum: 0
+          readOnly: true
+          description: Sum of `unitPrice` x `estimatedQuantity` for all items.
+          example: 180
+        finalTotal:
+          type: number
+          nullable: true
+          minimum: 0
+          readOnly: true
+          description: Sum of `unitPrice` x `actualQuantity`. `null` until actual quantities are recorded.
+          example: null
+        totalPrice:
+          type: number
+          minimum: 0
+          readOnly: true
+          description: Amount due. Equals `finalTotal` when recorded, otherwise `estimatedTotal`.
+          example: 180
+        statusHistory:
+          type: array
+          readOnly: true
+          description: Tracking history in time order, oldest first.
+          items:
+            $ref: '#/components/schemas/TrackingEvent'
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+
+    OrderCreate:
+      type: object
+      required: [partnerId, items, pickupDate, deliveryDate, pickupAddress]
+      properties:
+        partnerId:
+          $ref: '#/components/schemas/ObjectId'
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/OrderItemInput'
+        pickupDate:
+          type: string
+          format: date-time
+          description: Must be in the future.
+        deliveryDate:
+          type: string
+          format: date-time
+          description: Must be later than `pickupDate`.
+        pickupAddress:
+          $ref: '#/components/schemas/Location'
+        deliveryAddress:
+          allOf:
+            - $ref: '#/components/schemas/Location'
+          description: Optional. When omitted, delivery returns to `pickupAddress`.
+        specialInstructions:
+          type: string
+          maxLength: 500
+
+    OrderUpdate:
+      type: object
+      description: Full replacement of booking details (PUT). `partnerId` cannot be changed.
+      required: [items, pickupDate, deliveryDate, pickupAddress]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/OrderItemInput'
+        pickupDate:
+          type: string
+          format: date-time
+        deliveryDate:
+          type: string
+          format: date-time
+        pickupAddress:
+          $ref: '#/components/schemas/Location'
+        deliveryAddress:
+          allOf:
+            - $ref: '#/components/schemas/Location'
+          description: Optional. When omitted, delivery returns to `pickupAddress`.
+        specialInstructions:
+          type: string
+          maxLength: 500
+          description: Optional. When omitted, existing instructions are cleared.
+
+    OrderStatusUpdate:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [confirmed, cancelled]
+          description: Only these two values can be set by a request. `inprogress` and `completed` are set automatically.
+        note:
+          type: string
+          maxLength: 300
+          description: Optional note shown in the customer's tracking view.
+
+    OrderFulfillmentUpdate:
+      type: object
+      required: [stage]
+      properties:
+        stage:
+          type: string
+          enum: [out_for_pickup, picked_up, ready_for_delivery, out_for_delivery, delivered]
+          description: The next stage. `not_started` is the initial value and cannot be set.
+        note:
+          type: string
+          maxLength: 300
+          description: Optional note shown in the customer's tracking view.
+
+    ActualQuantitiesUpdate:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          description: Exactly one entry for every item of the order.
+          items:
+            type: object
+            required: [itemId, actualQuantity]
+            properties:
+              itemId:
+                $ref: '#/components/schemas/ObjectId'
+              actualQuantity:
+                type: number
+                minimum: 0.1
+                description: Decimal values are accepted for kg; whole numbers only for piece or load, based on the referenced order item's service unit.
+                example: 5.2
+        note:
+          type: string
+          maxLength: 300
+
+    RiderAssignment:
+      type: object
+      required: [riderId]
+      properties:
+        riderId:
+          $ref: '#/components/schemas/ObjectId'
+        note:
+          type: string
+          maxLength: 300
+
+    OrderList:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Order'
+        meta:
+          $ref: '#/components/schemas/PageMeta'
+
+    Review:
+      type: object
+      required: [id, customerId, partnerId, orderId, rating]
+      properties:
+        id:
+          $ref: '#/components/schemas/ObjectId'
+        customerId:
+          $ref: '#/components/schemas/ObjectId'
+        partnerId:
+          $ref: '#/components/schemas/ObjectId'
+        orderId:
+          $ref: '#/components/schemas/ObjectId'
+        rating:
+          type: integer
+          minimum: 1
+          maximum: 5
+          example: 5
+        comment:
+          type: string
+          maxLength: 1000
+          example: Fast pickup and the clothes smelled great.
+        createdAt:
+          type: string
+          format: date-time
+          readOnly: true
+        updatedAt:
+          type: string
+          format: date-time
+          readOnly: true
+
+    ReviewInput:
+      type: object
+      required: [orderId, rating]
+      properties:
+        orderId:
+          $ref: '#/components/schemas/ObjectId'
+        rating:
+          type: integer
+          minimum: 1
+          maximum: 5
+        comment:
+          type: string
+          maxLength: 1000
+
+    ReviewUpdate:
+      type: object
+      description: Partial update. Send only the fields to change, at least one. Unknown fields are rejected.
+      minProperties: 1
+      additionalProperties: false
+      properties:
+        rating:
+          type: integer
+          minimum: 1
+          maximum: 5
+        comment:
+          type: string
+          maxLength: 1000
+
+    ReviewList:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Review'
+        meta:
+          $ref: '#/components/schemas/PageMeta'
+
+  examples:
+    OrderPending:
+      summary: Newly booked order
+      value:
+        id: 665f3c8d9b1e8a0012a4b6f3
+        customerId: 665f1c2e9b1e8a0012a4b3c1
+        partnerId: 665f2a7b9b1e8a0012a4b4d2
+        riderId: null
+        items:
+          - id: 665f3c8d9b1e8a0012a4b6f4
+            serviceId: 665f2b3c9b1e8a0012a4b5e7
+            type: wash
+            name: Wash per kilo
+            unit: kg
+            description: Mixed clothes
+            estimatedQuantity: 4
+            actualQuantity: null
+            unitPrice: 45
+            subtotal: 180
+        pickupDate: '2026-11-05T09:00:00Z'
+        deliveryDate: '2026-11-06T17:00:00Z'
+        pickupAddress:
+          street: Corrales Ave, Brgy. Carmen
+          city: Cagayan de Oro
+          latitude: 8.4822
+          longitude: 124.6472
+        deliveryAddress:
+          street: Hayes St, Brgy. Nazareth
+          city: Cagayan de Oro
+          latitude: 8.4871
+          longitude: 124.6521
+        specialInstructions: Please use fragrance-free detergent. Call on arrival.
+        status: pending
+        fulfillmentStage: not_started
+        estimatedTotal: 180
+        finalTotal: null
+        totalPrice: 180
+        statusHistory:
+          - {kind: status, from: null, to: pending, note: "Order booked.", updatedBy: {id: 665f1c2e9b1e8a0012a4b3c1, name: Maria Santos, role: customer}, timestamp: '2026-11-03T08:30:00Z'}
+        createdAt: '2026-11-03T08:30:00Z'
+        updatedAt: '2026-11-03T08:30:00Z'
+
+    OrderConfirmed:
+      summary: Order accepted by the partner
+      value:
+        id: 665f3c8d9b1e8a0012a4b6f3
+        customerId: 665f1c2e9b1e8a0012a4b3c1
+        partnerId: 665f2a7b9b1e8a0012a4b4d2
+        riderId: null
+        items:
+          - id: 665f3c8d9b1e8a0012a4b6f4
+            serviceId: 665f2b3c9b1e8a0012a4b5e7
+            type: wash
+            name: Wash per kilo
+            unit: kg
+            description: Mixed clothes
+            estimatedQuantity: 4
+            actualQuantity: null
+            unitPrice: 45
+            subtotal: 180
+        pickupDate: '2026-11-05T09:00:00Z'
+        deliveryDate: '2026-11-06T17:00:00Z'
+        pickupAddress:
+          street: Corrales Ave, Brgy. Carmen
+          city: Cagayan de Oro
+          latitude: 8.4822
+          longitude: 124.6472
+        deliveryAddress:
+          street: Hayes St, Brgy. Nazareth
+          city: Cagayan de Oro
+          latitude: 8.4871
+          longitude: 124.6521
+        specialInstructions: Please use fragrance-free detergent. Call on arrival.
+        status: confirmed
+        fulfillmentStage: not_started
+        estimatedTotal: 180
+        finalTotal: null
+        totalPrice: 180
+        statusHistory:
+          - {kind: status, from: null, to: pending, note: "Order booked.", updatedBy: {id: 665f1c2e9b1e8a0012a4b3c1, name: Maria Santos, role: customer}, timestamp: '2026-11-03T08:30:00Z'}
+          - {kind: status, from: pending, to: confirmed, note: "Order accepted. We will assign a rider for tomorrow morning.", updatedBy: {id: 665f1d419b1e8a0012a4b3c9, name: Bubble Express Laundry, role: partner}, timestamp: '2026-11-03T08:45:00Z'}
+        createdAt: '2026-11-03T08:30:00Z'
+        updatedAt: '2026-11-03T08:45:00Z'
+
+    OrderRiderAssigned:
+      summary: Confirmed order with a rider assigned
+      value:
+        id: 665f3c8d9b1e8a0012a4b6f3
+        customerId: 665f1c2e9b1e8a0012a4b3c1
+        partnerId: 665f2a7b9b1e8a0012a4b4d2
+        riderId: 665f1e5a9b1e8a0012a4b3d4
+        items:
+          - id: 665f3c8d9b1e8a0012a4b6f4
+            serviceId: 665f2b3c9b1e8a0012a4b5e7
+            type: wash
+            name: Wash per kilo
+            unit: kg
+            description: Mixed clothes
+            estimatedQuantity: 4
+            actualQuantity: null
+            unitPrice: 45
+            subtotal: 180
+        pickupDate: '2026-11-05T09:00:00Z'
+        deliveryDate: '2026-11-06T17:00:00Z'
+        pickupAddress:
+          street: Corrales Ave, Brgy. Carmen
+          city: Cagayan de Oro
+          latitude: 8.4822
+          longitude: 124.6472
+        deliveryAddress:
+          street: Hayes St, Brgy. Nazareth
+          city: Cagayan de Oro
+          latitude: 8.4871
+          longitude: 124.6521
+        specialInstructions: Please use fragrance-free detergent. Call on arrival.
+        status: confirmed
+        fulfillmentStage: not_started
+        estimatedTotal: 180
+        finalTotal: null
+        totalPrice: 180
+        statusHistory:
+          - {kind: status, from: null, to: pending, note: "Order booked.", updatedBy: {id: 665f1c2e9b1e8a0012a4b3c1, name: Maria Santos, role: customer}, timestamp: '2026-11-03T08:30:00Z'}
+          - {kind: status, from: pending, to: confirmed, note: "Order accepted. We will assign a rider for tomorrow morning.", updatedBy: {id: 665f1d419b1e8a0012a4b3c9, name: Bubble Express Laundry, role: partner}, timestamp: '2026-11-03T08:45:00Z'}
+          - {kind: rider_assignment, from: null, to: 665f1e5a9b1e8a0012a4b3d4, note: "Pickup is at the dorm gate.", updatedBy: {id: 665f1d419b1e8a0012a4b3c9, name: Bubble Express Laundry, role: partner}, timestamp: '2026-11-03T09:00:00Z'}
+        createdAt: '2026-11-03T08:30:00Z'
+        updatedAt: '2026-11-03T09:00:00Z'
+
+    OrderWeighed:
+      summary: Laundry picked up and weighed
+      value:
+        id: 665f3c8d9b1e8a0012a4b6f3
+        customerId: 665f1c2e9b1e8a0012a4b3c1
+        partnerId: 665f2a7b9b1e8a0012a4b4d2
+        riderId: 665f1e5a9b1e8a0012a4b3d4
+        items:
+          - id: 665f3c8d9b1e8a0012a4b6f4
+            serviceId: 665f2b3c9b1e8a0012a4b5e7
+            type: wash
+            name: Wash per kilo
+            unit: kg
+            description: Mixed clothes
+            estimatedQuantity: 4
+            actualQuantity: 5.2
+            unitPrice: 45
+            subtotal: 234
+        pickupDate: '2026-11-05T09:00:00Z'
+        deliveryDate: '2026-11-06T17:00:00Z'
+        pickupAddress:
+          street: Corrales Ave, Brgy. Carmen
+          city: Cagayan de Oro
+          latitude: 8.4822
+          longitude: 124.6472
+        deliveryAddress:
+          street: Hayes St, Brgy. Nazareth
+          city: Cagayan de Oro
+          latitude: 8.4871
+          longitude: 124.6521
+        specialInstructions: Please use fragrance-free detergent. Call on arrival.
+        status: inprogress
+        fulfillmentStage: picked_up
+        estimatedTotal: 180
+        finalTotal: 234
+        totalPrice: 234
+        statusHistory:
+          - {kind: status, from: null, to: pending, note: "Order booked.", updatedBy: {id: 665f1c2e9b1e8a0012a4b3c1, name: Maria Santos, role: customer}, timestamp: '2026-11-03T08:30:00Z'}
+          - {kind: status, from: pending, to: confirmed, note: "Order accepted. We will assign a rider for tomorrow morning.", updatedBy: {id: 665f1d419b1e8a0012a4b3c9, name: Bubble Express Laundry, role: partner}, timestamp: '2026-11-03T08:45:00Z'}
+          - {kind: rider_assignment, from: null, to: 665f1e5a9b1e8a0012a4b3d4, note: "Pickup is at the dorm gate.", updatedBy: {id: 665f1d419b1e8a0012a4b3c9, name: Bubble Express Laundry, role: partner}, timestamp: '2026-11-03T09:00:00Z'}
+          - {kind: fulfillment, from: not_started, to: out_for_pickup, note: null, updatedBy: {id: 665f1e5a9b1e8a0012a4b3d4, name: Juan Dela Cruz, role: rider}, timestamp: '2026-11-05T08:50:00Z'}
+          - {kind: fulfillment, from: out_for_pickup, to: picked_up, note: "Collected one laundry bag.", updatedBy: {id: 665f1e5a9b1e8a0012a4b3d4, name: Juan Dela Cruz, role: rider}, timestamp: '2026-11-05T09:20:00Z'}
+          - {kind: status, from: confirmed, to: inprogress, note: "Set automatically when the laundry was picked up.", updatedBy: {id: 665f1e5a9b1e8a0012a4b3d4, name: Juan Dela Cruz, role: rider}, timestamp: '2026-11-05T09:20:00Z'}
+          - {kind: weights_recorded, from: "180", to: "234", note: "Weighed on arrival.", updatedBy: {id: 665f1d419b1e8a0012a4b3c9, name: Bubble Express Laundry, role: partner}, timestamp: '2026-11-05T10:10:00Z'}
+        createdAt: '2026-11-03T08:30:00Z'
+        updatedAt: '2026-11-05T10:10:00Z'
+
+    OrderReady:
+      summary: Laundry finished and ready for delivery
+      value:
+        id: 665f3c8d9b1e8a0012a4b6f3
+        customerId: 665f1c2e9b1e8a0012a4b3c1
+        partnerId: 665f2a7b9b1e8a0012a4b4d2
+        riderId: 665f1e5a9b1e8a0012a4b3d4
+        items:
+          - id: 665f3c8d9b1e8a0012a4b6f4
+            serviceId: 665f2b3c9b1e8a0012a4b5e7
+            type: wash
+            name: Wash per kilo
+            unit: kg
+            description: Mixed clothes
+            estimatedQuantity: 4
+            actualQuantity: 5.2
+            unitPrice: 45
+            subtotal: 234
+        pickupDate: '2026-11-05T09:00:00Z'
+        deliveryDate: '2026-11-06T17:00:00Z'
+        pickupAddress:
+          street: Corrales Ave, Brgy. Carmen
+          city: Cagayan de Oro
+          latitude: 8.4822
+          longitude: 124.6472
+        deliveryAddress:
+          street: Hayes St, Brgy. Nazareth
+          city: Cagayan de Oro
+          latitude: 8.4871
+          longitude: 124.6521
+        specialInstructions: Please use fragrance-free detergent. Call on arrival.
+        status: inprogress
+        fulfillmentStage: ready_for_delivery
+        estimatedTotal: 180
+        finalTotal: 234
+        totalPrice: 234
+        statusHistory:
+          - {kind: status, from: null, to: pending, note: "Order booked.", updatedBy: {id: 665f1c2e9b1e8a0012a4b3c1, name: Maria Santos, role: customer}, timestamp: '2026-11-03T08:30:00Z'}
+          - {kind: status, from: pending, to: confirmed, note: "Order accepted. We will assign a rider for tomorrow morning.", updatedBy: {id: 665f1d419b1e8a0012a4b3c9, name: Bubble Express Laundry, role: partner}, timestamp: '2026-11-03T08:45:00Z'}
+          - {kind: rider_assignment, from: null, to: 665f1e5a9b1e8a0012a4b3d4, note: "Pickup is at the dorm gate.", updatedBy: {id: 665f1d419b1e8a0012a4b3c9, name: Bubble Express Laundry, role: partner}, timestamp: '2026-11-03T09:00:00Z'}
+          - {kind: fulfillment, from: not_started, to: out_for_pickup, note: null, updatedBy: {id: 665f1e5a9b1e8a0012a4b3d4, name: Juan Dela Cruz, role: rider}, timestamp: '2026-11-05T08:50:00Z'}
+          - {kind: fulfillment, from: out_for_pickup, to: picked_up, note: "Collected one laundry bag.", updatedBy: {id: 665f1e5a9b1e8a0012a4b3d4, name: Juan Dela Cruz, role: rider}, timestamp: '2026-11-05T09:20:00Z'}
+          - {kind: status, from: confirmed, to: inprogress, note: "Set automatically when the laundry was picked up.", updatedBy: {id: 665f1e5a9b1e8a0012a4b3d4, name: Juan Dela Cruz, role: rider}, timestamp: '2026-11-05T09:20:00Z'}
+          - {kind: weights_recorded, from: "180", to: "234", note: "Weighed on arrival.", updatedBy: {id: 665f1d419b1e8a0012a4b3c9, name: Bubble Express Laundry, role: partner}, timestamp: '2026-11-05T10:10:00Z'}
+          - {kind: fulfillment, from: picked_up, to: ready_for_delivery, note: "Washed, dried, and folded. Ready for the rider.", updatedBy: {id: 665f1d419b1e8a0012a4b3c9, name: Bubble Express Laundry, role: partner}, timestamp: '2026-11-05T15:00:00Z'}
+        createdAt: '2026-11-03T08:30:00Z'
+        updatedAt: '2026-11-05T15:00:00Z'
