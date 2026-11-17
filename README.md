@@ -1,6 +1,3 @@
 ## Project: SwiftWash API
 ### Group Members
-Anggot 
-Sia
-Tomines
-Uy
+Anggot, Sia, Tomines, Uy
