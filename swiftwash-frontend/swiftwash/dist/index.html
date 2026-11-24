@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#7860ce"><meta name="description" content="A little less laundry. A little more life. Book trusted laundry services and track every pickup with SwiftWash.">
+<title>SwiftWash — Laundry, handled.</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;450;500;550;600;650;700&family=Manrope:wght@400;500;600;650;700;750;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css"><script type="module" src="app.js"></script>
+</head>
+<body>
+<div class="app-shell">
+<aside class="sidebar" id="sidebar">
+<div class="workspace-label">YOUR EVERYDAY, LIGHTER</div>
+<nav id="nav" aria-label="Main navigation"></nav>
+<div class="sidebar-bottom"><div class="help-card"><span class="help-icon" data-icon="sparkles"></span><h3>A fresh start?</h3><p>Let us take laundry<br>off your to-do list.</p><button class="text-button" data-action="book">Book a pickup <span>↗</span></button></div><button class="connection-button" data-action="connection"><span class="connection-dot"></span><span id="connection-label">Demo workspace</span><span data-icon="settings"></span></button><button class="profile" data-action="account"><span class="avatar" id="avatar">AM</span><span class="profile-copy"><strong id="profile-name">Alex Morgan</strong><small id="profile-role">Personal account</small></span><span data-icon="chevrons"></span></button></div>
+</aside>
+<div class="main-shell"><header class="topbar"><button class="icon-button mobile-menu" data-action="menu" aria-label="Toggle menu"><span data-icon="menu"></span></button><div class="breadcrumb">My workspace <span>/</span> <strong id="page-name">Overview</strong></div><div class="topbar-actions"><button class="location-button" data-action="location"><span data-icon="pin"></span><span id="city-label">Your neighborhood</span><span data-icon="chevron"></span></button><span class="top-divider"></span><button class="icon-button notification-button" data-action="notifications" aria-label="Notifications"><span data-icon="bell"></span><i></i></button><button class="top-avatar" data-action="account" aria-label="Your account">AM</button></div></header>
+<main id="main" tabindex="-1"><div class="loading-state"><span class="spinner"></span>Freshening things up…</div></main>
+<footer><span>Less laundry. More living.</span><span>Made for your everyday <span class="tiny-star">✦</span></span></footer>
+</div></div>
+<div id="modal-root"></div><div class="toasts" id="toasts" aria-live="polite"></div>
+</body></html>
